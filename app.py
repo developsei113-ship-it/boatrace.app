@@ -165,7 +165,7 @@ def load_venue_models(jcd_code: str) -> tuple:
         }
         model_1st_boat = pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_1st_boat_win.pkl"), "rb"))
         return expert_models, model_1st_boat
-    except Exception:
+    except Exception as e:
         st.error(f"🚨本当のエラー原因: {e}")
         st.error(f"モデルのロードエラー: 指定のディレクトリ({MODEL_DIR})に『 {n}_model_*.pkl 』が存在するか確認してください。")
         return None, None
