@@ -21,6 +21,7 @@ BEST_W1 = 1.0
 BEST_W2 = 1.0
 BEST_W3 = 1.0
 MODEL_DIR = "."
+SKIP_THRESHOLD = 0.30  # 1着確率の最大値がこれ以下の場合は賭け回避
 
 # ==========================================
 # ページ設定
@@ -97,6 +98,15 @@ st.markdown("""
         border-left: 6px solid #0056b3;
         margin-bottom: 20px;
     }
+    
+    /* 見送り（警告）用 */
+    .warning-header {
+        background-color: #fdfae6;
+        padding: 20px;
+        border-radius: 10px;
+        border-left: 6px solid #f39c12;
+        margin-bottom: 20px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -158,7 +168,6 @@ def load_and_preprocess_boatracer() -> pd.DataFrame:
 def load_venue_models(jcd_code: str) -> tuple:
     n = jcd_code 
     try:
-        # 【変更点】新モデルの出力ファイル名に合わせる
         expert_models = {
             '1st': pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_1st.pkl"), "rb")),
             '2nd': pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_2nd_or_3rd.pkl"), "rb")),
@@ -307,12 +316,11 @@ def get_custom_series_rank(row) -> float:
         return np.nan
 
 # ==========================================
-# 評価処理 (ダイレクト評価版・オッズ反映・1-3-3固定)
+# 評価処理
 # ==========================================
 def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loaded_data: tuple):
     expert_models, model_1st_boat, boatracer_df = loaded_data
     
-    # 【変更点】新モデルの学習プログラムと全く同じ順序で特徴量を定義
     boat1_features = ['1着率(%)', '全国勝率_num', '適性_節間成績', '展示タイム_diff']
     features = [
         '適性_節間成績', '展示タイム_diff', '節間平均ST_num', 
@@ -398,7 +406,54 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
         rank_2nd = np.argsort(p_2nd)[::-1] + 1
         rank_top3 = np.argsort(p_top3)[::-1] + 1
 
-        # 【変更点】1-3-3フォーメーションへ完全固定
+        # ==========================================
+        # 賭け回避（見送り）の判定
+        # ==========================================
+        max_1st_prob = np.max(p1)
+        if max_1st_prob <= SKIP_THRESHOLD:
+            st.markdown(f"""
+            <div class="warning-header">
+                <h3 style="margin-top: 0; color: #d35400;">⚠️ 賭け回避（見送り）推奨</h3>
+                <p style="margin-bottom: 0; font-size: 1.1rem; color: #555;">
+                    全艇の中で最も高い1着確率が <strong>{max_1st_prob*100:.1f}%</strong> であり、基準値（{SKIP_THRESHOLD*100:.0f}%超）に満たないため、<br>
+                    波乱の可能性が非常に高いと判断し、3連単の買い目予測を中止しました。
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # 見送りの場合でもデータが見れるようExpanderを開いておく
+            with st.expander("内部データとAI評価の可視化 (詳細)", expanded=True):
+                st.markdown("参考までに、AIが算出した各号艇の確率は以下の通りです。")
+                tab1, tab2 = st.tabs(["各号艇のAI評価", "入力された特徴量データ"])
+                
+                with tab1:
+                    prob_df = pd.DataFrame({
+                        "枠番": [f"{i}号艇" for i in range(1, 7)],
+                        "1着確率(%)": p1 * 100,
+                        "2～3着確率(%)": p_2nd * 100,
+                        "2～4着確率(%)": p_top3 * 100
+                    })
+                    st.dataframe(
+                        prob_df, hide_index=True, use_container_width=True,
+                        column_config={
+                            "1着確率(%)": st.column_config.ProgressColumn("1着確率", format="%.1f%%", min_value=0, max_value=100),
+                            "2～3着確率(%)": st.column_config.ProgressColumn("2着・3着確率", format="%.1f%%", min_value=0, max_value=100),
+                            "2～4着確率(%)": st.column_config.ProgressColumn("2〜4着確率", format="%.1f%%", min_value=0, max_value=100),
+                        }
+                    )
+                with tab2:
+                    feature_display_df = df[['枠番'] + features].copy()
+                    feature_display_df['枠番'] = feature_display_df['枠番'].astype(str) + "号艇"
+                    for col in features:
+                        feature_display_df[col] = feature_display_df[col].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "NaN")
+                    st.dataframe(feature_display_df, hide_index=True, use_container_width=True)
+            
+            # 予測をストップして関数を抜ける
+            return
+        # ==========================================
+
+
+        # 1-3-3フォーメーションへ完全固定
         # 1着: 1着確率トップの1艇
         candidates_1st = rank_1st[:1].tolist()
         
@@ -426,7 +481,6 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
             </p>
         </div>
         """, unsafe_allow_html=True)
-        # -----------------------------------------------------
 
         # 各買い目の計算（期待値とスコア）
         formation_bets = []
