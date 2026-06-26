@@ -158,16 +158,17 @@ def load_and_preprocess_boatracer() -> pd.DataFrame:
 def load_venue_models(jcd_code: str) -> tuple:
     n = jcd_code 
     try:
+        # 【変更点】新モデルの出力ファイル名に合わせる
         expert_models = {
             '1st': pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_1st.pkl"), "rb")),
-            '2nd': pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_2nd.pkl"), "rb")),
-            'top3': pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_top3.pkl"), "rb"))
+            '2nd': pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_2nd_or_3rd.pkl"), "rb")),
+            'top3': pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_2nd_to_4th.pkl"), "rb"))
         }
         model_1st_boat = pickle.load(open(os.path.join(MODEL_DIR, f"{n}_model_1st_boat_win.pkl"), "rb"))
         return expert_models, model_1st_boat
     except Exception as e:
-        st.error(f"🚨本当のエラー原因: {e}")
-        st.error(f"モデルのロードエラー: 指定のディレクトリ({MODEL_DIR})に『 {n}_model_*.pkl 』が存在するか確認してください。")
+        st.error(f"🚨エラー原因: {e}")
+        st.error(f"モデルロードエラー: {MODEL_DIR}内に {n}_model_1st.pkl, {n}_model_2nd_or_3rd.pkl などの新モデルが存在するか確認してください。")
         return None, None
 
 def scrape_target_race_basic(hd: str, rno: int, jcd: str) -> dict:
@@ -306,14 +307,15 @@ def get_custom_series_rank(row) -> float:
         return np.nan
 
 # ==========================================
-# 評価処理 (ダイレクト評価版・オッズ反映・フォーメーション分析)
+# 評価処理 (ダイレクト評価版・オッズ反映・1-3-3固定)
 # ==========================================
 def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loaded_data: tuple):
     expert_models, model_1st_boat, boatracer_df = loaded_data
     
+    # 【変更点】新モデルの学習プログラムと全く同じ順序で特徴量を定義
     boat1_features = ['1着率(%)', '全国勝率_num', '適性_節間成績', '展示タイム_diff']
     features = [
-        '節間平均ST_num', '適性_節間成績', '展示タイム_diff',
+        '適性_節間成績', '展示タイム_diff', '節間平均ST_num', 
         '全国勝率_num', '2連対率(%)', '3連対率(%)', '1着率(%)'
     ]
 
@@ -361,7 +363,6 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
         if missing_cols:
             missing_details = []
             for col in missing_cols:
-                # 欠損している号艇を取得
                 missing_boats = df[df[col].isna()]['枠番'].tolist()
                 boats_str = "、".join([f"{int(b)}号艇" for b in missing_boats])
                 missing_details.append(f"- **{col}** （対象: {boats_str}）")
@@ -373,7 +374,6 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
         for col in set(features + boat1_features):
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # モデルが記憶している正しい順番を取得する関数
         def get_expected_cols(model):
             if hasattr(model, 'feature_names_in_'):
                 return list(model.feature_names_in_) 
@@ -385,7 +385,7 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
         X_boat1 = df[df['枠番'] == 1].reindex(columns=expected_boat1_cols, fill_value=0)
         boat1_win_prob = model_1st_boat.predict_proba(X_boat1)[0][1]
 
-        # エキスパート予測用データ準備（ダイレクト評価）
+        # エキスパート予測用データ準備
         expected_pred_cols = get_expected_cols(expert_models['1st'])
         X_pred = df.reindex(columns=expected_pred_cols, fill_value=0)
         
@@ -398,39 +398,31 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
         rank_2nd = np.argsort(p_2nd)[::-1] + 1
         rank_top3 = np.argsort(p_top3)[::-1] + 1
 
-        # フォーメーションの決定
-        THRESHOLD = 0.99
-        if boat1_win_prob >= THRESHOLD:
-            candidates_1st = [1]
-            candidates_2nd = rank_2nd[:4].tolist()
-            candidates_3rd = rank_top3[:5].tolist()
-            form_type_text = "【1号艇1着固定フォーメーション】"
-        else:
-            candidates_1st = rank_1st[:2].tolist()
-            candidates_2nd = rank_2nd[:4].tolist()
-            candidates_3rd = rank_top3[:5].tolist()
-            form_type_text = "【通常フォーメーション】"
+        # 【変更点】1-3-3フォーメーションへ完全固定
+        # 1着: 1着確率トップの1艇
+        candidates_1st = rank_1st[:1].tolist()
+        
+        # 2着: 1着候補を除外した中から上位3艇
+        candidates_2nd = [b for b in rank_2nd if b not in candidates_1st][:3]
+        
+        # 3着: 1着候補を除外した中から上位3艇
+        candidates_3rd = [b for b in rank_top3 if b not in candidates_1st][:3]
 
         form_str_1st = "".join(map(str, sorted(candidates_1st)))
         form_str_2nd = "".join(map(str, sorted(candidates_2nd)))
         form_str_3rd = "".join(map(str, sorted(candidates_3rd)))
         formation_display = f"{form_str_1st}-{form_str_2nd}-{form_str_3rd}"
 
-
         prob_pct = boat1_win_prob * 100
-        
-        # 条件分岐なしのシンプルな定義
         prob_style = "color: #2c3e50; font-weight: bold;"
-        prob_icon = ""
-
         
-        # トップ情報の表示（1号艇確率とフォーメーション）
+        # トップ情報の表示
         st.markdown(f"""
         <div class="highlight-header">
-            <h3 style="margin-top: 0; color: #333;">🎯 予測フォーメーション: <span style="color: #0056b3;">{formation_display}</span></h3>
+            <h3 style="margin-top: 0; color: #333;">🎯 予測フォーメーション: <span style="color: #e74c3c;">{formation_display}</span></h3>
             <p style="margin-bottom: 0; font-size: 1.1rem; color: #555;">
-                <strong>1号艇1着確率:</strong> <span style="{prob_style}">{prob_icon}{prob_pct:.1f}%</span> <br>
-                <span style="font-size: 0.9rem;">(AI判定: {form_type_text})</span>
+                <strong>1号艇1着確率(参考):</strong> <span style="{prob_style}">{prob_pct:.1f}%</span> <br>
+                <span style="font-size: 0.9rem;">(AI判定: 1-3-3完全固定フォーメーション)</span>
             </p>
         </div>
         """, unsafe_allow_html=True)
@@ -472,8 +464,8 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
             ev_str = f"{ev_val:.2f}" if ev_val > 0 else "算出不可"
             odds_str = f"{res['odds']:.1f}倍" if res['odds'] > 0 else "未発表"
             
-            # スコア順位が8位以内 (i < 8) かつ EVが1.0以上の場合は赤文字＆太字にして炎アイコンを追加
-            if i < 8 and ev_val >= 1.0:
+            # EVが1.0以上の場合は赤文字＆太字にして炎アイコンを追加
+            if ev_val >= 1.0:
                 ev_style = "color: #e74c3c; font-weight: 900; font-size: 1.05rem;"
                 ev_icon = "🔥 "
             else:
@@ -504,8 +496,8 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
                 prob_df = pd.DataFrame({
                     "枠番": [f"{i}号艇" for i in range(1, 7)],
                     "1着確率(%)": p1 * 100,
-                    "2着確率(%)": p_2nd * 100,
-                    "3着内確率(%)": p_top3 * 100
+                    "2～3着確率(%)": p_2nd * 100,
+                    "2～4着確率(%)": p_top3 * 100
                 })
                 st.dataframe(
                     prob_df,
@@ -513,8 +505,8 @@ def evaluate_single_race(hd_input: str, rno: int, jcd: str, jcd_name: str, loade
                     use_container_width=True,
                     column_config={
                         "1着確率(%)": st.column_config.ProgressColumn("1着確率", format="%.1f%%", min_value=0, max_value=100),
-                        "2着確率(%)": st.column_config.ProgressColumn("2着ダイレクト評価", format="%.1f%%", min_value=0, max_value=100),
-                        "3着内確率(%)": st.column_config.ProgressColumn("3着内確率", format="%.1f%%", min_value=0, max_value=100),
+                        "2～3着確率(%)": st.column_config.ProgressColumn("2着・3着確率", format="%.1f%%", min_value=0, max_value=100),
+                        "2～4着確率(%)": st.column_config.ProgressColumn("2〜4着確率", format="%.1f%%", min_value=0, max_value=100),
                     }
                 )
 
